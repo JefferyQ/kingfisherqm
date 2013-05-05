@@ -1,0 +1,415 @@
+#!/usr/bin/perl
+#
+#
+#
+# Kingfisher Quota Manager
+#
+# (c) 2008 Geovanny Junio <geovanny@eutsiv.com.br>
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+
+use strict;
+use warnings;
+
+use utf8;
+use Encode;
+
+use DBI;
+use File::Basename;
+use IPC::Shareable;
+use Proc::Daemon;
+use Proc::PID::File;
+use Sys::Syslog qw/ :standard /;
+
+BEGIN {
+
+    push @INC, '/usr/lib/kingfisher';
+
+}
+
+use KF::Common::General;
+use KF::Common::ReadConf;
+
+# Daemonize
+Proc::Daemon::Init();
+
+# If already running, then exit
+if(Proc::PID::File->running()) {
+    exit();
+}
+
+# Initializes
+
+# Variable that keep the server running
+my $keep = 1;
+
+$SIG{CHLD} = 'IGNORE';
+$SIG{INT} = sub { $keep = 0 };
+
+# Variables
+our($db_host, $db_name, $db_user, $db_pass, $log_level);
+
+# Hash of count jobs status
+our %jobs;
+# Tie jobs for IPC::Shareable
+our $handle_jobs = tie %jobs, 'IPC::Shareable', undef, { destroy => 0 };
+
+$jobs{WAITING} = 0;
+$jobs{READY} = 0;
+
+
+# Hash of printers working
+our %printers;
+# Tie printers for IPC::Shareable
+our $handle_printers = tie %printers, 'IPC::Shareable', undef, { destroy => 0 };
+
+# Read Conf values
+my $conf = ReadConf->new();
+
+$db_host = $conf->{db_host};
+$db_name = $conf->{db_name};
+$db_user = $conf->{db_user};
+$db_pass = $conf->{db_pass};
+$log_level = $conf->{log_level};
+
+undef($conf);
+
+# Get jobs ready from printqueue
+# This is necessary cause the server
+# can down without jobs ready be printed
+
+my $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+my $sth = $dbh->prepare("select count(*) as rowcount from printqueue where job_status='R'");
+$sth->execute() or die;
+my @result = $sth->fetchrow_array();
+
+# Set jobs with Sending status to Ready status
+# This is necessary cause the server
+# can down without printing jobs be printed
+$dbh->do("update printqueue set job_status='W' where job_status='S'");
+$dbh->commit();
+
+
+$sth->finish();
+$dbh->disconnect();
+
+# Get news jobs waiting
+$handle_jobs->shlock();
+$jobs{READY} += $result[0];
+$handle_jobs->shunlock();
+
+# Work
+MAIN_LOOP: while((sleep 1) && $keep) {
+
+    # Get waiting jobs
+    get_waiting_jobs();
+
+    # Check jobs rules
+    check_rules_job() if($jobs{WAITING} == 1);
+
+    # Print next ready job ( order by date and time asc )
+    if($jobs{READY} > 0) {
+
+        my $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+        my $sth = $dbh->prepare("select job_id, printername from printqueue where job_status='R' order by job_date asc, job_time asc");
+        $sth->execute() or die;
+        my @result;
+
+        my $pid;
+        while(@result = $sth->fetchrow_array()) {
+            # If printer not in use
+            if(!defined($printers{$result[1]}) || !($printers{$result[1]})) {
+
+                $sth->finish();
+                $dbh->disconnect();
+
+                $handle_printers->shlock();
+                $printers{$result[1]} = 1;
+                $handle_printers->shunlock();
+
+                if($pid = fork()) {
+                    next MAIN_LOOP;
+                }
+                elsif(defined($pid)) {
+                    print_ready_job($result[0]);
+                }
+            }
+        }
+
+        $sth->finish();
+        $dbh->disconnect();
+
+    }
+
+
+}
+
+
+sub get_waiting_jobs {
+
+    my $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+    my $sth = $dbh->prepare("select count(*) as rowcount from printqueue where job_status='W'");
+    $sth->execute() or die;
+    my @result = $sth->fetchrow_array();
+
+    $sth->finish();
+    $dbh->disconnect();
+
+    # Get news jobs waiting
+    $jobs{WAITING} = 1 if($result[0] > 0);
+
+    return;
+
+}
+
+
+sub check_rules_job {
+
+
+    my $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+    my $sth = $dbh->prepare("select job_id, host, printername, username, title, colormode, duplex, job_size, copies, number_of_pages, total_pages, paperformatname from printqueue where job_status='W' order by job_date asc, job_time asc limit 1");
+    $sth->execute() or die;
+    my @result = $sth->fetchrow_array();
+
+    $sth->finish();
+    $dbh->disconnect();
+
+    # Get database data
+    my($job_id, $host, $printername, $username, $title, $colormode, $duplex, $job_size, $copies, $number_of_pages, $total_pages, $paperformatname) = @result;
+
+    # Rules will be here
+    #-------------------
+    #-------------------
+    $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+    $dbh->do("update printqueue set job_status='R' where job_id=$job_id");
+    $dbh->commit();
+
+    $dbh->disconnect();
+
+    $handle_jobs->shlock();
+    $jobs{WAITING} = 0;
+    $jobs{READY}++;
+    $handle_jobs->shunlock();
+
+    return;
+
+}
+
+
+
+sub print_ready_job {
+
+    my $job = shift;
+
+    local $SIG{CHLD} = '';
+
+    logger(basename($0)." [job $job]", 'info', 'New Job Started');
+
+    my $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+    my $sth = $dbh->prepare("select job_id, backends_dir, backend, device_uri, host, printername, username, title, colormode, duplex, job_size, copies, number_of_pages, total_pages, paperformatname, job_options, doc_path from printqueue where job_id=$job");
+    $sth->execute() or die;
+    my @result = $sth->fetchrow_array();
+
+    $sth->finish();
+    $dbh->disconnect();
+
+
+    # Get database data
+    my($job_id, $backends_dir, $backend, $device_uri, $host, $printername, $username, $title, $colormode, $duplex, $job_size, $copies, $number_of_pages, $total_pages, $paperformatname, $job_options, $doc_path) = @result;
+
+
+    # Set job_status to printing and update date e time of job
+    $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+    $dbh->do("update printqueue set job_status='S', job_date=current_date , job_time=localtime(0) where job_id=$job_id");
+    $dbh->commit();
+    $sth->finish();
+    $dbh->disconnect();
+
+
+    # Copy of printername variable
+    # used on printers_working
+    my $printername2 = $printername;
+
+    # Set enviroment variables for real backend
+    $ENV{DEVICE_URI} = $device_uri;
+    $ENV{PRINTER} = $printername;
+
+    my $backend_command = "$backends_dir/$backend $job_id \"$username\" \"$title\" $copies \"$job_options\" $doc_path";
+
+    # Execute real backend command
+    logger(basename($0)." [job $job]", 'info', "Real backend command: $backend_command") if($log_level == 1);
+    system($backend_command);
+
+    # Get return code from real backend call
+    my $return_code = $?;
+
+    # log return code
+    logger(basename($0)."[job $job]", 'info', "Real Backend return code: $return_code") if($log_level == 1);
+
+    # If a error on system
+    if($return_code == -1) {
+        logger(basename($0)."[job $job]", 'err', "Error on real backend execute: $!");
+
+        # Return job_status to Ready
+        $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+        $dbh->do("update printqueue set job_status='R' where job_id=$job_id");
+        $dbh->commit();
+        $dbh->disconnect();
+    }
+    # If sucessfull
+    # Save informations on DB
+    elsif($return_code == 0) {
+
+        logger(basename($0)." [job $job]", 'info', 'Saving job information into database.') if($log_level == 1);
+
+        # Variables
+	    my($sector, $costcenter);
+
+	    # USER
+	    # Check if user exists
+	    my $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+	    my $sth = $dbh->prepare("select id, sectors_id, costscenter_id from users where username='$username'");
+	    $sth->execute() or die;
+	    my @result = $sth->fetchrow_array();
+	    # If user do not exists
+	    if(@result == 0) {
+	        $dbh->do("insert into users(username, sectors_id, costscenter_id) values('$username', 1, 1)");
+	        $dbh->commit();
+	        $username = $dbh->last_insert_id(undef, undef, 'users', undef);
+	        $sector = 1;
+	        $costcenter = 1;
+	    }
+	    # If user exists return id
+	    else {
+	        $username = $result[0];
+	        $sector = $result[1];
+	        $costcenter = $result[2];
+	    }
+
+
+	    # PRINTER
+	    # Check if printer exists
+	    $sth = $dbh->prepare("select id from printers where printername='$printername'");
+	    $sth->execute() or die;
+	    @result = $sth->fetchrow_array();
+	    # If printer do not exists
+	    if(@result == 0) {
+	        $dbh->do("insert into printers(printername) values('$printername')");
+	        $dbh->commit();
+	        $printername = $dbh->last_insert_id(undef, undef, 'printers', undef);
+	    }
+	    # If printer exists return id
+	    else {
+	        $printername = $result[0];
+	    }
+
+
+	    # TYPE PAPER
+	    # Check if paper_format exists
+	    $sth = $dbh->prepare("select id from paperformats where paperformatname='$paperformatname'");
+	    $sth->execute() or die;
+	    @result = $sth->fetchrow_array();
+	    # If paper format do not exists
+	    if(@result == 0) {
+	        $dbh->do("insert into paperformats(paperformatname) values('$paperformatname')");
+	        $dbh->commit();
+	        $paperformatname = $dbh->last_insert_id(undef, undef, 'paperformats', undef);
+	    }
+	    # If printer exists return id
+	    else {
+	        $paperformatname = $result[0];
+	    }
+
+
+	    # PRICE
+	    # Define price for gray or color mode
+	    my $query;
+	    if($colormode eq 'G') {
+	        $query = 'select price_gray from settings';	
+	    }
+	    else {
+	        $query = 'select price_color from settings';
+	    }
+	    # Get price
+	    $sth = $dbh->prepare($query);
+	    $sth->execute() or die;
+	    @result = $sth->fetchrow_array();
+	    my $price = $result[0];
+
+
+        # Price calcs
+        $sth = $dbh->prepare("select page_price_percent from paperformats where id='$paperformatname'");
+	    $sth->execute() or die;
+	    @result = $sth->fetchrow_array();
+        $price = $price + (($result[0]/100) * $price);
+
+        $price *= $total_pages;	
+
+	    # ----------------------------------------------------------------------------
+
+        # UTF-8 Encode some fields
+        $title = encode("UTF-8", $title);
+
+	    # PRINT LOG
+	    $dbh->do("insert into printlogs(job_date, job_time, host, users_id, sectors_id, costscenter_id, printers_id, paperformats_id, title, job_size, colormode, copies, number_of_pages, total_pages, price) values(current_date, localtime(0) , '$host', '$username', '$sector', '$costcenter', '$printername', '$paperformatname', '$title', '$job_size', '$colormode', $copies, $number_of_pages, $total_pages, $price)") or logger(basename($0)." [job $job]", 'err', 'Cant add job to printlogs:'.$dbh->errstr());
+        $dbh->do("delete from printqueue where job_id=$job_id") or logger(basename($0)." [job $job]", 'err', 'Cant delete job from printqueue:'.$dbh->errstr());
+	    $dbh->commit();
+
+ 	    # Close DB connection
+	    $sth->finish();
+	    $dbh->disconnect();
+
+        $handle_jobs->shlock();
+        $jobs{READY}--;
+        $handle_jobs->shunlock();
+
+        logger(basename($0)." [job $job]", 'info', 'Job information saved with sucess.') if($log_level == 1);
+
+        unlink($doc_path);
+
+    }
+    elsif(($return_code >> 8) == 4) {
+
+        logger(basename($0)." [job $job]", 'err', "Could not call the real backend. Return code: $?");
+
+        # Set job_status to Paused
+        $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+        $dbh->do("update printqueue set job_status='P' where job_id=$job_id");
+        $dbh->commit();
+        $dbh->disconnect();
+
+    }
+    else {
+        logger(basename($0)." [job $job]", 'err', "Could not call the real backend. Return code: $?");
+
+        # Return job_status to Ready
+        $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+        $dbh->do("update printqueue set job_status='R' where job_id=$job_id");
+        $dbh->commit();
+        $dbh->disconnect();
+
+    }
+
+    # Define printer not working
+    $handle_printers->shlock();
+    $printers{$printername2} = 0;
+    $handle_printers->shunlock();
+
+    exit();
+
+}
+
+
+__END__

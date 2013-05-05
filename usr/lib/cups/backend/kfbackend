@@ -1,0 +1,267 @@
+#!/usr/bin/perl
+#
+#
+#
+# Kingfisher Quota Manager
+#
+# (c) 2008 Geovanny Junio <geovanny@eutsiv.com.br>
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+use strict;
+use warnings;
+
+use utf8;
+use Encode;
+
+use DBI;
+use File::Basename;
+use File::Copy;
+use File::Temp;
+use Sys::Syslog qw/:standard/;
+
+BEGIN {
+
+    push @INC, '/usr/lib/kingfisher';
+
+}
+
+use KF::Common::General;
+use KF::Common::ReadConf;
+use KF::Job::PaperFormat;
+use KF::Job::NumberOfPages;
+use KF::IPP::GetJobAttrs;
+use KF::PDL::Pclxl;
+use KF::PDL::Qpdl;
+
+# Variables
+my($db_host, $db_name, $db_user, $db_pass, $kf_spool_path, $python_path, $pkpgcounter_path, $log_level);
+
+# Get Conf values
+my $conf = ReadConf->new();
+
+$db_host = $conf->{db_host};
+$db_name = $conf->{db_name};
+$db_user = $conf->{db_user};
+$db_pass = $conf->{db_pass};
+$kf_spool_path = $conf->{kf_spool_path};
+$python_path = $conf->{python_path};
+$pkpgcounter_path = $conf->{pkpgcounter_path};
+$log_level = $conf->{log_level};
+
+
+# Directory backends path and own backend name
+my $backends_dir = dirname($0);
+my $kingfisher_backend = basename($0);
+
+
+=item main
+
+    The main program
+
+=cut
+
+if(@ARGV == 0) {
+
+    # Get all backends files in backends_dir
+    my @backends = glob($backends_dir.'/*');
+
+    logger($kingfisher_backend, 'info', 'Getting backends.');
+    logger($kingfisher_backend, 'info', 'Backends list:') if($log_level == 1);
+
+    foreach my $backend (@backends) {
+	
+	    next if($backend =~ /$kingfisher_backend/ || ! -f $backend || ! -x $backend);
+
+	    logger($kingfisher_backend, 'info', "---> $backend") if($log_level == 1);
+
+	    my @backend_output = `$backend`;
+
+	    foreach(@backend_output) {
+	    
+	        if(/^(\w+)\s+(\w+)\s+("[\w\s\(\)]+")\s+("[\w\s\(\)\/]+")$/) {
+	
+		        my $be_typeconn = $1;
+		        my $be_dev = $2;
+		        my $be_param = $3;
+                my $be_desc = $4;
+                $be_desc =~ s/"//g;
+		        print "$be_typeconn $kingfisher_backend:$be_dev $be_param \"$be_desc (KingFisher Quota Manager)\"\n";
+	        }
+	    }
+    }
+
+}
+else {
+
+    logger($kingfisher_backend, 'info','Print job received.') if($log_level == 1);
+
+    # Doc Path
+    my $doc_path;
+
+    # If a wrong number of parameters
+    if(@ARGV < 5 || @ARGV > 6) {
+	    logger($kingfisher_backend, 'err', 'Wrong number of parameters.');
+	    die;
+    }
+    elsif(@ARGV == 5) {
+
+        my $tmpfile = File::Temp->new( TEMPLATE => 'kingfisher_XXXXXX',
+				       DIR => $kf_spool_path,
+				       SUFFIX => '.job',
+				       UNLINK => 0);
+
+	    # Send doc received from Cups to tmpfile
+	    print $tmpfile $_ while(<STDIN>);
+
+        # Get tmpfile path
+	    $doc_path = $tmpfile->filename;
+
+    	if($log_level == 1) {
+	        logger($kingfisher_backend, 'info', "Cups sent five parameters: @ARGV");
+	        logger($kingfisher_backend, 'info', "Temporary file path: $doc_path");
+	    }
+
+    }
+    elsif(@ARGV == 6) {
+
+	    $doc_path = $ARGV[5];
+	    chomp($doc_path);
+
+        my $tmpfile = File::Temp->new( TEMPLATE => 'kingfisher_XXXXXX',
+				       DIR => $kf_spool_path,
+				       SUFFIX => '.job',
+				       UNLINK => 0);
+
+        copy($doc_path, $tmpfile->filename);
+        $doc_path = $tmpfile->filename;
+
+	    if($log_level == 1) {
+	        logger($kingfisher_backend, 'info', "Cups sent six parameters: @ARGV");
+	        logger($kingfisher_backend, 'info', "Temporary file path: $doc_path");
+	    }
+    }
+
+
+    # Get the rest of Cups parameters 
+    my($job_id, $user, $title, $copies, $job_options, undef) = @ARGV;
+    my($host, $paperformat, $job_size, $job_status, $colormode, $duplex);
+
+
+    # Get host
+    #logger($kingfisher_backend, 'info', 'Getting IP host.');
+    $host = get_host($job_id);
+
+
+    # THIS PART POSSIBLE WILL BE EXTERNAL
+    #--------------------------------------------------------------------------
+
+    # Remove ilegal character
+    $title =~ s/'//g;
+
+    # Fix title of jobs from samba
+    $title =~ s/^smbprn\.\d+//;
+
+    if($title =~ /^\s*Remote\s*Downlevel\s*Document\s*$/i) {
+	open(JOB, "<$doc_path");
+	    while(<JOB>) {
+		    if(/PJL\s*JOB\s*NAME\s*=\s*\"(.+)\"/) {
+		        $title = $1;
+		        last;
+		    }
+		    elsif(/PJL\s*SET\s*JOB\s*NAME\s*=\s*\"(.+)\"/) {
+		        $title = $1;
+		        last;
+		    }
+		    elsif(/\%\%Title:\s*\((.+)\)/i) {
+		        $title = $1;
+		        last;
+		    }
+            elsif(/\%\%Title:\s*(.+)/i) {
+                $title = $1;
+                last;
+            }
+	    }
+	close(JOB);
+    }
+
+    #--------------------------------------------------------------------------
+
+
+    # Get Job size
+    $job_size = -s $doc_path;
+    $job_size = size_human_readable($job_size);
+
+    # ColorMode
+    $colormode = 'G'; # Only GrayScale, Need implement this in futures revisions
+
+    # Duplex
+    $duplex = 'N'; # Only NO, Need implement this in futures revisions
+
+    # Job status
+    $job_status = 'W'; # All jobs enter in print queue with WAITING status
+
+    # Get number of pages
+    my $number_of_pages = number_of_pages($kingfisher_backend, $python_path, $pkpgcounter_path, $doc_path);
+
+    # Total pages number_of_pages * copies
+    my $total_pages = $number_of_pages * $copies;
+
+    # Get Type Paper
+    $paperformat = get_paperformat($doc_path);
+
+    # If empty fields and user fields in lower
+    if($user =~ /^\s*$/) {
+	    $user = 'empty';
+    }
+    else {
+	    $user = lc($user); 
+    }
+
+    $title = 'Empty' if($title =~ /^\s*$/);
+    $paperformat = 'Unknow PDL Format' if($paperformat =~ /^\s*$/);
+
+    # UTF-8 Encode some fields
+    $title = encode("UTF-8", $title);
+
+
+    # Get device_uri from Cups enviroment variables
+    my $device_uri = $ENV{DEVICE_URI};
+
+    # Only the real backend
+    $device_uri =~ s/^$kingfisher_backend:(.*)$/$1/;
+
+    # Get the real backend
+    my $backend = $device_uri;
+    $backend =~ s/^([^:\/]+)(.*|$)/$1/;
+
+    # Get printer name from Cups enviroment variables
+    my $printer = $ENV{PRINTER};
+
+    # Save data in print queue
+	my $dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host", $db_user, $db_pass, { AutoCommit => 0 } ) or die;
+	$dbh->do("insert into printqueue(job_date, job_time, job_id, job_status,backends_dir, backend, device_uri, host, printername, username, title, colormode, duplex, job_size, copies, number_of_pages, total_pages, paperformatname, job_options, doc_path) values(current_date, localtime(0) , $job_id, '$job_status', '$backends_dir', '$backend', '$device_uri', '$host', '$printer', '$user', '$title', '$colormode', '$duplex', '$job_size', $copies, $number_of_pages, $total_pages, '$paperformat', '$job_options', '$doc_path')");
+	$dbh->commit();
+
+    # Close DB connection
+	$dbh->disconnect();
+
+    logger($kingfisher_backend, 'info', 'Job information sent to print queue.') if($log_level == 1);
+
+    # Return 0 to CUPS
+    exit(0);
+
+}
+
+__END__

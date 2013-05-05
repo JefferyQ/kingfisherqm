@@ -1,0 +1,11 @@
+Package: kingfisher
+Version: 0.0.1
+Section: utils
+Priority: optional
+Essential: no
+Maintainer: Geovanny Junio <geovannyjs@gmail.com>
+Architecture: all
+Depends: cups, pkpgcounter, libproc-daemon-perl, libproc-pid-file-perl, libipc-shareable-perl, libdbd-pg-perl, libgd-graph-perl, libgd-graph3d-perl
+Pre-Depends: perl-base (>= 5.6), libdbd-pg-perl, php5-pgsql
+Installed-Size: 460
+Description: Printing Billing

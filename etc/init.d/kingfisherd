@@ -1,0 +1,31 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+case "$1" in
+    start)
+	echo -n "Starting: Kingfisher Quota Manager Daemon"
+        /usr/sbin/kingfisherd
+	echo "."	
+    ;;
+
+    stop)
+	echo -n "Stopping: Kingfisher Quota Manager Daemon"
+	KPID=`cat /var/run/kingfisherd.pid`
+	kill $KPID
+	echo "."	
+    ;;
+
+    restart)
+	$0 stop
+	sleep 2
+	$0 start
+    ;;
+    
+    *)
+	echo "Usage: /etc/init.d/kingfisherd {start|stop|restart}" >&2
+	exit 1
+    ;;
+esac
+
+exit 0

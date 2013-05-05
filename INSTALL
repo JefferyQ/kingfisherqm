@@ -1,0 +1,36 @@
+# Kingfisher Quota Manager
+#
+# (c) 2008 Geovanny Junio <geovanny@eutsiv.com.br>
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+Depends:
+cups
+php5 (with pdo)
+postgresql
+perl (Proc::Daemon, Proc::PID::File, IPC::Shareable, DBD::Pg, GD::Graph, GD::Graph3D)
+python
+pkpgcounter
+
+Run: 
+./setup.pl
+
+Create a PostgreSQL database and populate with this file:
+/usr/share/doc/kingfisher/kingfisher.pg.sql
+
+Edit /etc/kingfisher/kingfisher.conf
+
+Edit /usr/share/kingfisher/inc/config.inc.php
+
+And, init Kingfisher Daemon with: /etc/init.d/kingfisherd start
